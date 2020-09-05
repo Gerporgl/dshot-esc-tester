@@ -45,29 +45,17 @@ PID myPID(&Input, &Output, &Setpoint,1.00,8.0,0.01, DIRECT);
 #define POT_PIN 4
 #define DSHOT_PIN 5
 
-long thrust = 0;
-
-TaskHandle_t Task1;
-
 rmt_data_t dshotPacket[18];
 rmt_obj_t* rmt_send = NULL;
 
-hw_timer_t * timer = NULL;
 hw_timer_t * timerDshot = NULL;
 
 HardwareSerial MySerial(1);
 
 uint8_t receivedBytes = 0;
 volatile bool requestTelemetry = false;
-bool printTelemetry = true;
 uint16_t dshotUserInputValue = 0;
-uint16_t dshotmin = 48;
-uint16_t dshotmax = 2047;
-uint16_t dshotidle = dshotmin + round(3.5*(dshotmax-dshotmin)/100); // 3.5%
-uint16_t dshot50 =   dshotmin + round(50*(dshotmax-dshotmin)/100); // 50%
-uint16_t dshot75 =   dshotmin + round(75*(dshotmax-dshotmin)/100); // 75%
 int16_t ESC_telemetrie[5]; // Temperature, Voltage, Current, used mAh, eRpM
-bool runMQTBSequence = false;
 int target_value=0; // Target value from POT after filtering
 int current_value=0; // Smoothed value
 int target_rpm=0;
@@ -76,7 +64,6 @@ uint16_t dshotCommand=0;
 bool pid_on=false;
 uint32_t last_rpm=0;
 
-uint32_t currentTime;
 uint8_t temperature = 0;
 uint8_t temperatureMax = 0;
 float voltage = 0;
@@ -191,8 +178,8 @@ uint32_t ticks=now;
 int last_val=val;
 
 uint32_t last_stat=0;
-uint32_t last_smooth=0;;
-float adc_val =0;
+uint32_t last_smooth=0;
+float adc_val=0;
 
 void loop() {
     now=micros();
@@ -200,7 +187,6 @@ void loop() {
         pid_on=false;
     else
         pid_on=true;
-    
 
     if(now-ticks >= 100)
     {
@@ -225,7 +211,7 @@ void loop() {
         else
             val=0;
 
-        if(last_val != val && (val<=0 || val >= 1999 || abs(last_val-val) >= 5))
+        if(last_val != val && (val<=0 || val >= 1999 || abs(last_val-val) >= 5)) // Filter even more for small variations
         {
             last_val=val;
             
@@ -238,10 +224,8 @@ void loop() {
            
         }
 
-
         if(now - last_smooth >= 1000)
         {
-
             last_smooth=now;
 
             if(current_value < target_value)
@@ -267,7 +251,6 @@ void loop() {
             last_stat=now;
             Serial.printf("ms: %d rpm: %d rpm_age: %d volt: %.2f dshot: %d target_rpm %d target_val: %d cv: %d pid: %d\n",now/1000, rpm, (now-last_rpm)/1000, voltage, dshotUserInputValue, target_rpm, target_value, current_value, pid_val);
         }
-        
     }
    
     if(!requestTelemetry) {
@@ -278,79 +261,78 @@ void loop() {
 
 void receiveTelemtrie(){
     static uint8_t SerialBuf[10];
-    
 
-        if(MySerial.available()){
-            SerialBuf[receivedBytes] = MySerial.read();
-            receivedBytes++;
-        }
+    if(MySerial.available()){
+        SerialBuf[receivedBytes] = MySerial.read();
+        receivedBytes++;
+    }
 
-        if(receivedBytes > 9){ // transmission complete
-          
-            uint8_t crc8 = get_crc8(SerialBuf, 9); // get the 8 bit CRC
-          
-            if(crc8 != SerialBuf[9]) {
-                // These errors appear to happen on regular basis, at least on the only ESC I tested with
-                // I couldn't see on the scope if anythign was wrong, or if this is just the ESC not sending all the data properly
-                // regardless, at very fast (around 1 ms) telemetry request speed
-                // the average telemetry successful responses always seems to come at 0-2 ms intervals
-                //Serial.println("CRC transmission failure");
-                
-                // Empty Rx Serial of garbage telemtry
-                while(MySerial.available())
-                    MySerial.read();
-                
-                requestTelemetry = true;
+    if(receivedBytes > 9){ // transmission complete
+        
+        uint8_t crc8 = get_crc8(SerialBuf, 9); // get the 8 bit CRC
+        
+        if(crc8 != SerialBuf[9]) {
+            // These errors appear to happen on regular basis, at least on the only ESC I tested with
+            // I couldn't see on the scope if anything was wrong, or if this is just the ESC not sending all the data properly
+            // regardless, at very fast (around 1 ms) telemetry request speed, the average telemetry successful responses
+            // always seems to come at 0-2 ms intervals.
+            //Serial.println("CRC transmission failure");
             
-                return; // transmission failure 
-            }
-          
-            // compute the received values
-            ESC_telemetrie[0] = SerialBuf[0]; // temperature
-            ESC_telemetrie[1] = (SerialBuf[1]<<8)|SerialBuf[2]; // voltage
-            ESC_telemetrie[2] = (SerialBuf[3]<<8)|SerialBuf[4]; // Current
-            ESC_telemetrie[3] = (SerialBuf[5]<<8)|SerialBuf[6]; // used mA/h
-            ESC_telemetrie[4] = (SerialBuf[7]<<8)|SerialBuf[8]; // eRpM *100
+            // Empty Rx Serial of garbage telemtry
+            while(MySerial.available())
+                MySerial.read();
             
             requestTelemetry = true;
-         
-            temperature = 0.9*temperature + 0.1*ESC_telemetrie[0];
-            if (temperature > temperatureMax) {
-                temperatureMax = temperature;
-            }
-            
-            voltage = 0.9*voltage + 0.1*(ESC_telemetrie[1] / 100.0);
-            if (voltage < voltageMin) {
-                voltageMin = voltage;
-            }
-            
-            current = 0.9*current + 0.1*(ESC_telemetrie[2] * 100);
-            if (current > currentMax) {
-                currentMax = current;
-            }
-            
-            // This averaging is also working ok for the current PID loop and settings, but I've lowered the weight of older samples
-            erpm = 0.8*erpm + 0.2*(ESC_telemetrie[4] * 100);
-            if (erpm > erpmMax) {
-                erpmMax = erpm;
-            }
-            
-            rpm = erpm / (MOTOR_POLES / 2);
-            if (rpm > rpmMAX) {
-                rpmMAX = rpm;
-            }
-            last_rpm=micros();
-            
-            if (rpm) {                  // Stops weird numbers :|
-                kv = rpm / voltage / ( (float(dshotUserInputValue) - dshotmin) / (dshotmax - dshotmin) );
-            } else {
-                kv = 0;
-            }
-            if (kv > kvMax) {
-                kvMax = kv;
-            }
-          
+        
+            return; // transmission failure 
         }
+        
+        // compute the received values
+        ESC_telemetrie[0] = SerialBuf[0]; // temperature
+        ESC_telemetrie[1] = (SerialBuf[1]<<8)|SerialBuf[2]; // voltage
+        ESC_telemetrie[2] = (SerialBuf[3]<<8)|SerialBuf[4]; // Current
+        ESC_telemetrie[3] = (SerialBuf[5]<<8)|SerialBuf[6]; // used mA/h
+        ESC_telemetrie[4] = (SerialBuf[7]<<8)|SerialBuf[8]; // eRpM *100
+        
+        requestTelemetry = true;
+        
+        temperature = 0.9*temperature + 0.1*ESC_telemetrie[0];
+        if (temperature > temperatureMax) {
+            temperatureMax = temperature;
+        }
+        
+        voltage = 0.9*voltage + 0.1*(ESC_telemetrie[1] / 100.0);
+        if (voltage < voltageMin) {
+            voltageMin = voltage;
+        }
+        
+        current = 0.9*current + 0.1*(ESC_telemetrie[2] * 100);
+        if (current > currentMax) {
+            currentMax = current;
+        }
+        
+        // This averaging is also working ok for the current PID loop and settings, but I've lowered the weight of older samples
+        erpm = 0.8*erpm + 0.2*(ESC_telemetrie[4] * 100);
+        if (erpm > erpmMax) {
+            erpmMax = erpm;
+        }
+        
+        rpm = erpm / (MOTOR_POLES / 2);
+        if (rpm > rpmMAX) {
+            rpmMAX = rpm;
+        }
+        last_rpm=micros();
+        
+        if (rpm) {                  // Stops weird numbers :|
+            kv = rpm / voltage / ( (float(dshotUserInputValue) - dshotmin) / (dshotmax - dshotmin) );
+        } else {
+            kv = 0;
+        }
+        if (kv > kvMax) {
+            kvMax = kv;
+        }
+        
+    }
 
   return;
   
@@ -401,7 +383,7 @@ void dshotOutput(uint16_t value, bool telemetry) {
     // Tried to use rmtLoop from latest ESP32 master branch, but it doesn't seem to allow seemless synchronyzed updates,
     // but also since we need to turn on and off the telemetry bit it wasn't practical so reverted back to the rmtWrite in
     // a fast loop. It would be nice to find a way to have this dshot loop perfectly working and synced eventually so that there is no
-    // jitter.
+    // jitter and glitch.
    /* dshotPacket[0].level0 = 0;
     dshotPacket[0].duration0 = 586;
     dshotPacket[0].level1 = 0;
