@@ -45,7 +45,10 @@ PID myPID(&Input, &Output, &Setpoint,1.00,8.0,0.01, DIRECT);
 #define POT_PIN 4
 #define DSHOT_PIN 5
 
-rmt_data_t dshotPacket[18];
+#define DSHOT_PACKETS 1 // Number of packets to send in one batch
+#define DSHOT_PACKET_LEN 17 // This includes a pause at the end
+#define DSHOT_PACKETS_LEN 1+(DSHOT_PACKET_LEN*DSHOT_PACKETS)
+rmt_data_t dshotPacket[DSHOT_PACKETS_LEN]; // One pause at start, one in between packets, and at the end of all.
 rmt_obj_t* rmt_send = NULL;
 
 hw_timer_t * timerDshot = NULL;
@@ -74,8 +77,6 @@ uint32_t erpm = 0;
 uint32_t erpmMax = 0;
 uint32_t rpm = 0;
 uint32_t rpmMAX = 0;
-uint32_t kv = 0;
-uint32_t kvMax = 0;
 
 uint8_t telemetryskips=0;
 int pid_val=0;
@@ -117,9 +118,9 @@ void IRAM_ATTR onDshotTimer(){
         dshotUserInputValue=current_value+48;   
 
     if(dshotCommand==0)
-        dshotOutput(dshotUserInputValue, (telemetryskips%32==0));
+        dshotOutput(dshotUserInputValue, (telemetryskips%16==0));
     else
-        dshotOutput(dshotCommand, (telemetryskips%32==0));
+        dshotOutput(dshotCommand, (telemetryskips%16==0));
    
     if (requestTelemetry) {                
         requestTelemetry = false;
@@ -130,7 +131,7 @@ void IRAM_ATTR onDshotTimer(){
 void startDShotTimer() {
     timerDshot = timerBegin(1, 80, true); // timer_id = 0; divider=80; countUp = true;
     timerAttachInterrupt(timerDshot, &onDshotTimer, true); // edge = true
-    timerAlarmWrite(timerDshot, 100, true);  //1000 = 1 ms
+    timerAlarmWrite(timerDshot, 100*2, true);  //1000 = 1 ms
     timerAlarmEnable(timerDshot);
 }
 
@@ -276,7 +277,7 @@ void receiveTelemtrie(){
             // I couldn't see on the scope if anything was wrong, or if this is just the ESC not sending all the data properly
             // regardless, at very fast (around 1 ms) telemetry request speed, the average telemetry successful responses
             // always seems to come at 0-2 ms intervals.
-            //Serial.println("CRC transmission failure");
+            Serial.println("CRC transmission failure");
             
             // Empty Rx Serial of garbage telemtry
             while(MySerial.available())
@@ -323,15 +324,7 @@ void receiveTelemtrie(){
         }
         last_rpm=micros();
         
-        if (rpm) {                  // Stops weird numbers :|
-            kv = rpm / voltage / ( (float(dshotUserInputValue) - dshotmin) / (dshotmax - dshotmin) );
-        } else {
-            kv = 0;
-        }
-        if (kv > kvMax) {
-            kvMax = kv;
-        }
-        
+       
     }
 
   return;
@@ -340,17 +333,79 @@ void receiveTelemtrie(){
 
 void dshotOutput(uint16_t value, bool telemetry) {
     
-    uint16_t packet;
+    uint16_t packet, telemetry_packet, packet_copy;
     
     // telemetry bit    
-    if (telemetry) {
+    /*if (telemetry) {
         requestTelemetry=true;
         packet = (value << 1) | 1;
-    } else {
+    } else*/ {
         packet = (value << 1) | 0;
     }
 
-    // https://github.com/betaflight/betaflight/blob/09b52975fbd8f6fcccb22228745d1548b8c3daab/src/main/drivers/pwm_output.c#L523
+
+    telemetry_packet = dshot_checksum(packet|1);
+    packet = dshot_checksum(packet);
+  
+
+    // durations are for dshot600
+    // https://blck.mn/2016/11/dshot-the-new-kid-on-the-block/
+    // Bit length (total timing period) is 1.67 microseconds (T0H + T0L or T1H + T1L).
+    // For a bit to be 1, the pulse width is 1250 nanoseconds (T1H – time the pulse is high for a bit value of ONE)
+    // For a bit to be 0, the pulse width is 625 nanoseconds (T0H – time the pulse is high for a bit value of ZERO)
+    packet_copy=packet;
+    for(int offset = 1; offset < (DSHOT_PACKETS*DSHOT_PACKET_LEN+1); offset+=DSHOT_PACKET_LEN)
+    {
+        packet=packet_copy;
+        if(offset==1 && telemetry)
+        {
+            packet=telemetry_packet; // Request telemetry in the first packet
+            requestTelemetry=true;
+        }
+        else
+            packet=packet_copy;
+        
+        dshotPacket[offset+16].level0 = 0;
+        dshotPacket[offset+16].duration0 = 1500;
+        dshotPacket[offset+16].level1 = 0;
+        dshotPacket[offset+16].duration1 = 1500;
+        for (int i = 0; i < 16; i++) {
+            if (packet & 0x8000) {
+                dshotPacket[i+offset].level0 = 1;
+                dshotPacket[i+offset].duration0 = 100;
+                dshotPacket[i+offset].level1 = 0;
+                dshotPacket[i+offset].duration1 = 34;
+            } else {
+                dshotPacket[i+offset].level0 = 1;
+                dshotPacket[i+offset].duration0 = 50;
+                dshotPacket[i+offset].level1 = 0;
+                dshotPacket[i+offset].duration1 = 84;
+            }
+            packet <<= 1;
+        }
+    }
+
+    // Tried to use rmtLoop from latest ESP32 master branch, but it doesn't seem to allow seemless synchronyzed updates,
+    // but also since we need to turn on and off the telemetry bit it wasn't practical so reverted back to the rmtWrite in
+    // a fast loop. It would be nice to find a way to have this dshot loop perfectly working and synced eventually so that there is no
+    // jitter and glitch.
+    dshotPacket[0].level0 = 0;
+    dshotPacket[0].duration0 = 1500;
+    dshotPacket[0].level1 = 0;
+    dshotPacket[0].duration1 = 1500;
+  /*  dshotPacket[17].level0 = 0;
+    dshotPacket[17].duration0 = 586;
+    dshotPacket[17].level1 = 0;
+    dshotPacket[17].duration1 = 586;*/
+ 
+    rmtWrite(rmt_send, dshotPacket, DSHOT_PACKETS_LEN);
+
+    
+    return;
+
+}
+uint16_t dshot_checksum(uint16_t packet){
+     // https://github.com/betaflight/betaflight/blob/09b52975fbd8f6fcccb22228745d1548b8c3daab/src/main/drivers/pwm_output.c#L523
     int csum = 0;
     int csum_data = packet;
     for (int i = 0; i < 3; i++) {
@@ -359,45 +414,7 @@ void dshotOutput(uint16_t value, bool telemetry) {
     }
     csum &= 0xf;
     packet = (packet << 4) | csum;
-
-    // durations are for dshot600
-    // https://blck.mn/2016/11/dshot-the-new-kid-on-the-block/
-    // Bit length (total timing period) is 1.67 microseconds (T0H + T0L or T1H + T1L).
-    // For a bit to be 1, the pulse width is 1250 nanoseconds (T1H – time the pulse is high for a bit value of ONE)
-    // For a bit to be 0, the pulse width is 625 nanoseconds (T0H – time the pulse is high for a bit value of ZERO)
-    for (int i = 0; i < 16; i++) {
-        if (packet & 0x8000) {
-              dshotPacket[i].level0 = 1;
-              dshotPacket[i].duration0 = 100;
-              dshotPacket[i].level1 = 0;
-              dshotPacket[i].duration1 = 34;
-          } else {
-              dshotPacket[i].level0 = 1;
-              dshotPacket[i].duration0 = 50;
-              dshotPacket[i].level1 = 0;
-              dshotPacket[i].duration1 = 84;
-          }
-        packet <<= 1;
-    }
-
-    // Tried to use rmtLoop from latest ESP32 master branch, but it doesn't seem to allow seemless synchronyzed updates,
-    // but also since we need to turn on and off the telemetry bit it wasn't practical so reverted back to the rmtWrite in
-    // a fast loop. It would be nice to find a way to have this dshot loop perfectly working and synced eventually so that there is no
-    // jitter and glitch.
-   /* dshotPacket[0].level0 = 0;
-    dshotPacket[0].duration0 = 586;
-    dshotPacket[0].level1 = 0;
-    dshotPacket[0].duration1 = 586;
-    dshotPacket[17].level0 = 0;
-    dshotPacket[17].duration0 = 586;
-    dshotPacket[17].level1 = 0;
-    dshotPacket[17].duration1 = 586;*/
- 
-    rmtWrite(rmt_send, dshotPacket, 16);
-
-    
-    return;
-
+    return packet;
 }
 
 uint8_t update_crc8(uint8_t crc, uint8_t crc_seed){
