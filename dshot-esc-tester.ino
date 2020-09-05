@@ -47,7 +47,7 @@ PID myPID(&Input, &Output, &Setpoint,1.00,8.0,0.01, DIRECT);
 
 #define DSHOT_PACKETS 1 // Number of packets to send in one batch
 #define DSHOT_PACKET_LEN 17 // This includes a pause at the end
-#define DSHOT_PACKETS_LEN 1+(DSHOT_PACKET_LEN*DSHOT_PACKETS)
+#define DSHOT_PACKETS_LEN (DSHOT_PACKET_LEN*DSHOT_PACKETS)
 rmt_data_t dshotPacket[DSHOT_PACKETS_LEN]; // One pause at start, one in between packets, and at the end of all.
 rmt_obj_t* rmt_send = NULL;
 
@@ -117,10 +117,12 @@ void IRAM_ATTR onDshotTimer(){
     else
         dshotUserInputValue=current_value+48;   
 
+    #define TELEMETRY_SKIP_MOD 4
+
     if(dshotCommand==0)
-        dshotOutput(dshotUserInputValue, (telemetryskips%16==0));
+        dshotOutput(dshotUserInputValue, (telemetryskips%TELEMETRY_SKIP_MOD==0));
     else
-        dshotOutput(dshotCommand, (telemetryskips%16==0));
+        dshotOutput(dshotCommand, (telemetryskips%TELEMETRY_SKIP_MOD==0));
    
     if (requestTelemetry) {                
         requestTelemetry = false;
@@ -131,7 +133,7 @@ void IRAM_ATTR onDshotTimer(){
 void startDShotTimer() {
     timerDshot = timerBegin(1, 80, true); // timer_id = 0; divider=80; countUp = true;
     timerAttachInterrupt(timerDshot, &onDshotTimer, true); // edge = true
-    timerAlarmWrite(timerDshot, 100*2, true);  //1000 = 1 ms
+    timerAlarmWrite(timerDshot, 100*8, true);  //1000 = 1 ms
     timerAlarmEnable(timerDshot);
 }
 
@@ -277,7 +279,7 @@ void receiveTelemtrie(){
             // I couldn't see on the scope if anything was wrong, or if this is just the ESC not sending all the data properly
             // regardless, at very fast (around 1 ms) telemetry request speed, the average telemetry successful responses
             // always seems to come at 0-2 ms intervals.
-            Serial.println("CRC transmission failure");
+            //Serial.println("CRC transmission failure");
             
             // Empty Rx Serial of garbage telemtry
             while(MySerial.available())
@@ -335,14 +337,7 @@ void dshotOutput(uint16_t value, bool telemetry) {
     
     uint16_t packet, telemetry_packet, packet_copy;
     
-    // telemetry bit    
-    /*if (telemetry) {
-        requestTelemetry=true;
-        packet = (value << 1) | 1;
-    } else*/ {
-        packet = (value << 1) | 0;
-    }
-
+    packet = (value << 1) | 0;
 
     telemetry_packet = dshot_checksum(packet|1);
     packet = dshot_checksum(packet);
@@ -354,10 +349,10 @@ void dshotOutput(uint16_t value, bool telemetry) {
     // For a bit to be 1, the pulse width is 1250 nanoseconds (T1H – time the pulse is high for a bit value of ONE)
     // For a bit to be 0, the pulse width is 625 nanoseconds (T0H – time the pulse is high for a bit value of ZERO)
     packet_copy=packet;
-    for(int offset = 1; offset < (DSHOT_PACKETS*DSHOT_PACKET_LEN+1); offset+=DSHOT_PACKET_LEN)
+    for(int offset = 0; offset < (DSHOT_PACKETS*DSHOT_PACKET_LEN); offset+=DSHOT_PACKET_LEN)
     {
         packet=packet_copy;
-        if(offset==1 && telemetry)
+        if(offset<DSHOT_PACKET_LEN && telemetry)
         {
             packet=telemetry_packet; // Request telemetry in the first packet
             requestTelemetry=true;
@@ -385,18 +380,6 @@ void dshotOutput(uint16_t value, bool telemetry) {
         }
     }
 
-    // Tried to use rmtLoop from latest ESP32 master branch, but it doesn't seem to allow seemless synchronyzed updates,
-    // but also since we need to turn on and off the telemetry bit it wasn't practical so reverted back to the rmtWrite in
-    // a fast loop. It would be nice to find a way to have this dshot loop perfectly working and synced eventually so that there is no
-    // jitter and glitch.
-    dshotPacket[0].level0 = 0;
-    dshotPacket[0].duration0 = 1500;
-    dshotPacket[0].level1 = 0;
-    dshotPacket[0].duration1 = 1500;
-  /*  dshotPacket[17].level0 = 0;
-    dshotPacket[17].duration0 = 586;
-    dshotPacket[17].level1 = 0;
-    dshotPacket[17].duration1 = 586;*/
  
     rmtWrite(rmt_send, dshotPacket, DSHOT_PACKETS_LEN);
 
