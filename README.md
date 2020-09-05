@@ -1,50 +1,16 @@
-Uses the dshot600 protocol to communicate with the a blheli32 ESC and receive telemetry.  Telemetry data is used to calculate KV and all info is displayed on the OLED.
+Forked from JyeSmith/dshot-esc-tester
 
-Great for testing hand wound motors KV or new/troublesome motors.
+This is an ESP32 (from Espressif) arduino project that uses the dshot600 protocol to communicate with a blheli32 ESC and receive telemetry.
 
-Optional loadcell can be added to the pin header highlighted with the orange circle below.  Data is printed via serial every 2-3ms.
+This fork from the original JyeSmith/dshot-esc-tester project is a bit simpler to use without all the LCD and other hardware required.
 
-20 second demo video https://www.youtube.com/watch?v=VLMNEdSz4wI
+I added a PID controller using the RPM from the telemetry and made the dshot loop a lot faster and telemetry requests as well so that motor torque can increase very quickly using the PID feedback to compensate in output load differences on the motor.
 
-Schematics and PCB https://easyeda.com/jyesmith/kv-meter
+In order ot make the loop faster I relied only on timers, the second core task is no longer used (somehow I couldn't use delayMicroseconds...), the main loop only gets the telemetry from the serial and reads the input from a pot to set the motor speed.
 
-<img src="/images/top loadcell.jpg" width="300"> <img src="/images/bottom.jpg" width="300">
+The PID can be disabled by just not connecting the telemetry pin (it times out after 25ms), or simply forcing the pid_on to be false in the code.
+The current PID values were tested only briefly so far on a TMoror MN5008 without any load on the motor except by hand to calibrate the PID values roughly.
 
-Results form a rewound emax 2306 stator.  Left is with 8 turns and the right images is with 9 turns.
+The purpose of that version is not to drive a drone or helicopter motor, but for general purpose brushless motor driving where you need to maintain a more precise constant RPM, or simply as a starting point when you want to drive a brushless motor with a potentiometer usign dshot (the delay can be made extremely short if you remove the smoothing algorithms)
 
-<img src="/images/8turn.jpg" width="300"> <img src="/images/9turn.jpg" width="300">
-
-**WARNING - If `#define MINIQUADTESTBENCH` is uncommented the test sequence used by https://www.miniquadtestbench.com/ will automatically start!!!**  Below shows the results of testing an original EMAX RS2306 2400KV motor against the same motor wound with 0.5mm wire 8 & 9 turns per tooth.
-
-<img src="/images/thruststand.jpg" width="600">
-
-<img src="/data/EMAX RS2306 2400KV/comparison plots 4s.png" width="600">
-
-<img src="/data/EMAX RS2306 2400KV/comparison plots 4s zoomed.png" width="600">
-
-6s data below also shows a comparison between single and multistrand windings.
-
-<img src="/data/EMAX RS2306 2400KV/comparison plots 6s.png" width="600">
-
-<img src="/data/EMAX RS2306 2400KV/comparison plots 6s zoomed.png" width="600">
-
-## BOM
-
-- Upload the gerber zip in the pcb folder to jlcpcb.com, select 1.6mm PCB thickness, and your favourite colour.
-- ESP32 development board.  Get the same one as in the images above to be sure it mounts correctly.  I removed the black plastic standoff on the pins so that it sits flat on the PCB and gives enough headroom for the upper PCB and regulator.
-- You favourite blheli32 esc.  Make sure it has telemetry out and ideally a current sensor.
-- OLED 128*64.  There are 2 common version but the Vcc and GND pins are swapped.  This PCB has been designed to take both and you select which pin receives Vcc/GND by soldering the jumpers.
-- A 3V3 or 5V regulator.  Either can be used and solder the jumper to which ever voltage you have used.  This makes sure the ESP32 is powered correctly.
-- Optional loadcell for measuring thrust.
-
-<img src="/pcb/pcb.png" width="600">
-
-## If you make one I would love to see it.  Please post your pics as an issue or add them to this readme :)
-
-## neohito
-
-<img src="/images/builds/neohito.jpg" width="600">
-
-## Alex
-
-<img src="/images/builds/AlexM1.jpg" width="200"><img src="/images/builds/AlexM2.jpg" width="200"><img src="/images/builds/AlexM3.jpg" width="200">
+Thanks to Jye Smith for putting together the only nice arduino based DSHOT esc example that is actually usable and fast. I'm hoping there will be many more libraries in the future to drive ESCs with digital protocols such as dshot to allow more precise motor control for general purpose use (and at low cost using generic hardware) and not just for drone motor control. At the time of this writing, there is really a lack of clean documentation about the DSHOT protocol in blheli at the electrical level as well as the list of special commands supported so far (1-47).

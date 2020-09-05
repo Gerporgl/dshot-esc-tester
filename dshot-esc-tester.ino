@@ -14,41 +14,48 @@
  * https://www.rcgroups.com/forums/showatt.php?attachmentid=8521072&d=1450345654 * 
  */
 
-//%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-// www.miniquadtestbench.com
-// Uncommenting the below define will start the test sequence defined on MQTB
-// WARNING - THE MOTOR WILL START TO SPIN AUTOMATICALLY!!!
-//#define MINIQUADTESTBENCH
-//%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
 #include <HardwareSerial.h>
-#include "SSD1306.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "Arduino.h"
 #include "esp32-hal.h"
-#include "HX711.h"
 
-#define MOTOR_POLES 14
+#include <PID_v1.h>
 
-// HX711
-#define LOADCELL_DOUT_PIN     25
-#define LOADCELL_SCK_PIN      26
-#define LOADCELL_CALIBRATION  345.0
-HX711 loadcell;
+//PID: Define Variables we'll be connecting to
+double Setpoint, Input, Output;
+
+// Specify the links and initial tuning parameters
+// Good starting point, TMotor MN5008, free spinning, sample time set at 6ms and telemetry almost the same
+//PID myPID(&Input, &Output, &Setpoint,3.00,20.0,0.05, DIRECT);
+// Not bad 2
+//PID myPID(&Input, &Output, &Setpoint,3.00,30.0,0.04, DIRECT);
+// Not bad 3, all those first 3 PID settings are at 6ms sample and %64 telemetry
+//PID myPID(&Input, &Output, &Setpoint,2.00,20.0,0.04, DIRECT);
+// New test PID sample rate at 3ms and %32 telemetry
+// Not bad 4 (starting point)
+//PID myPID(&Input, &Output, &Setpoint,2.00,20.0,0.02, DIRECT);
+// Better 5
+//PID myPID(&Input, &Output, &Setpoint,1.00,10.0,0.02, DIRECT);
+// Better 6
+PID myPID(&Input, &Output, &Setpoint,1.00,8.0,0.01, DIRECT);
+
+#define MOTOR_POLES 28
+#define POT_PIN 4
+#define DSHOT_PIN 5
+
 long thrust = 0;
 
 TaskHandle_t Task1;
 
-rmt_data_t dshotPacket[16];
+rmt_data_t dshotPacket[18];
 rmt_obj_t* rmt_send = NULL;
 
 hw_timer_t * timer = NULL;
+hw_timer_t * timerDshot = NULL;
 
 HardwareSerial MySerial(1);
-
-SSD1306  display(0x3c, 21, 22);  // 21 and 22 are default pins
 
 uint8_t receivedBytes = 0;
 volatile bool requestTelemetry = false;
@@ -61,6 +68,13 @@ uint16_t dshot50 =   dshotmin + round(50*(dshotmax-dshotmin)/100); // 50%
 uint16_t dshot75 =   dshotmin + round(75*(dshotmax-dshotmin)/100); // 75%
 int16_t ESC_telemetrie[5]; // Temperature, Voltage, Current, used mAh, eRpM
 bool runMQTBSequence = false;
+int target_value=0; // Target value from POT after filtering
+int current_value=0; // Smoothed value
+int target_rpm=0;
+uint16_t dshotCommand=0;
+
+bool pid_on=false;
+uint32_t last_rpm=0;
 
 uint32_t currentTime;
 uint8_t temperature = 0;
@@ -76,208 +90,195 @@ uint32_t rpmMAX = 0;
 uint32_t kv = 0;
 uint32_t kvMax = 0;
 
-void gotTouch8(){
-    dshotUserInputValue = 0;
-    runMQTBSequence = false;
-    printTelemetry = true;
-    } // DIGITAL_CMD_MOTOR_STOP
-void gotTouch9(){
-    dshotUserInputValue = 247;
-    resetMaxMinValues();
-    runMQTBSequence = false;
-    printTelemetry = true;
-    } // 10%
-void gotTouch7(){
-    dshotUserInputValue = 447;
-    resetMaxMinValues();
-    runMQTBSequence = false;
-    printTelemetry = true;
-    } // 20%
-void gotTouch6(){
-    dshotUserInputValue = 1047;
-    resetMaxMinValues();
-    runMQTBSequence = false;
-    printTelemetry = true;
-    } // 50%
-void gotTouch5(){ 
-    dshotUserInputValue = 2047;                 
-    resetMaxMinValues();
-    runMQTBSequence = false;
-    printTelemetry = true;
-    } // 100%
-void gotTouch4(){ 
-    temperatureMax = 0;
-    voltageMin = 99;
-    currentMax = 0;
-    erpmMax = 0;
-    rpmMAX = 0;
-    kvMax = 0;
-    runMQTBSequence = false;
-    printTelemetry = true;
-}
-void resetMaxMinValues() {
-    gotTouch4();
-}
+uint8_t telemetryskips=0;
+int pid_val=0;
 
-void IRAM_ATTR getTelemetry(){
-    requestTelemetry = true;        
-}
-
-void startTelemetryTimer() {
-    timer = timerBegin(0, 80, true); // timer_id = 0; divider=80; countUp = true;
-    timerAttachInterrupt(timer, &getTelemetry, true); // edge = true
-    timerAlarmWrite(timer, 20000, true);  //1000 = 1 ms
-    timerAlarmEnable(timer);
-}
-
-// Second core used to handle dshot packets
-void secondCoreTask( void * pvParameters ){
-    while(1){
-      
-        dshotOutput(dshotUserInputValue, requestTelemetry);
+void IRAM_ATTR onDshotTimer(){
+    telemetryskips++;
+ 
+    if(pid_on)
+    {
+        if(rpm<65)
+            Input=65;
+        else
+            Input = rpm;
+        Setpoint = target_rpm; //map(current_value,60,1999,130,8000);
+        myPID.Compute();
+        pid_val=map(Output, 130, 8000, 60, 1999); // Working with rpms although it wasn't probably required...
+    }
+    else
+    {
+        // Continue to feed the PID loop fooling it to think the motor is at stable RPM and low setpoint so that it doesn't get back crazy
+        // It stil does for a short blip...
+        Input = 135;
+        Setpoint = 130;
+        myPID.Compute();
+        pid_val=map(Output, 130, 8000, 60, 1999);
+    }
     
-        if (requestTelemetry) {                
-            requestTelemetry = false;
-            receivedBytes = 0;
-        }
+    if(current_value>=70)
+    {
         
-        delay(1);
-        
-    } 
+        if(pid_on)
+            dshotUserInputValue=pid_val+48;
+        else if(current_value<=160)
+            dshotUserInputValue=60+48;    
+        else
+            dshotUserInputValue=current_value+48;  
+    }
+    else
+        dshotUserInputValue=current_value+48;   
+
+    if(dshotCommand==0)
+        dshotOutput(dshotUserInputValue, (telemetryskips%32==0));
+    else
+        dshotOutput(dshotCommand, (telemetryskips%32==0));
+   
+    if (requestTelemetry) {                
+        requestTelemetry = false;
+        receivedBytes = 0;
+    }   
+}
+
+void startDShotTimer() {
+    timerDshot = timerBegin(1, 80, true); // timer_id = 0; divider=80; countUp = true;
+    timerAttachInterrupt(timerDshot, &onDshotTimer, true); // edge = true
+    timerAlarmWrite(timerDshot, 100, true);  //1000 = 1 ms
+    timerAlarmEnable(timerDshot);
 }
 
 void setup() {
 
+    digitalWrite(DSHOT_PIN, 0);
+    pinMode(DSHOT_PIN, OUTPUT);
+    pinMode(POT_PIN,INPUT);
     Serial.begin(115200);
-    MySerial.begin(115200, SERIAL_8N1, 16, 17);
-
-    loadcell.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
-    loadcell.set_scale(LOADCELL_CALIBRATION);
-    loadcell.tare();  
+    MySerial.begin(115200, SERIAL_8N1, 16, 17); 
     
-    if ((rmt_send = rmtInit(5, true, RMT_MEM_64)) == NULL) {
+    if ((rmt_send = rmtInit(DSHOT_PIN, true, RMT_MEM_64)) == NULL) {
         Serial.println("init sender failed\n");
     }
 
     float realTick = rmtSetTick(rmt_send, 12.5); // 12.5ns sample rate
     Serial.printf("rmt_send tick set to: %fns\n", realTick);
-  
-    display.init();
-    display.flipScreenVertically();
-    display.setFont(ArialMT_Plain_10); 
-    
-    // Output disarm signal while esc initialises and do some display stuff.
-    uint8_t xbeep = random(15, 100);
-    uint8_t ybeep = random(15, 50);
-    uint8_t ibeep = 0;
-    while (millis() < 3500) {
-        dshotOutput(0, false);
-        delay(1);  
-        
-        display.clear();            
-        ibeep++; 
-        if (ibeep == 100) {
-            ibeep = 0;
-            xbeep = random(15, 50);
-            ybeep = random(15, 50);
-        }
-        display.drawString(xbeep, ybeep, "beep");
-        if (millis() < 500) {         
-            display.drawString(0, 0, "Initialising ESC... 4s");
-        } else if (millis() < 1500) {   
-            display.drawString(0, 0, "Initialising ESC... 3s");
-        } else if (millis() < 2500) {  
-            display.drawString(0, 0, "Initialising ESC... 2s");
-        } else {                
-            display.drawString(0, 0, "Initialising ESC... 1s");
-        }
-        display.display(); 
-    }
-    
-    touchAttachInterrupt(T4, gotTouch4, 40);
-    touchAttachInterrupt(T5, gotTouch5, 40);
-    touchAttachInterrupt(T6, gotTouch6, 40);
-    touchAttachInterrupt(T7, gotTouch7, 40);
-    touchAttachInterrupt(T8, gotTouch8, 40);
-    touchAttachInterrupt(T9, gotTouch9, 40);
 
+    Input = 0;
+    Setpoint = 0;
+
+    //turn the PID on
+    myPID.SetMode(AUTOMATIC);
+    myPID.SetOutputLimits(130, 8000); // Again, we work with RPMs...
+    myPID.SetSampleTime(3); // 3 ms is the fastest so far, and should be close to the average telemetry receive frequency
+
+    dshotOutput(48, false);
+    dshotUserInputValue=0;
+    
     // Empty Rx Serial of garbage telemtry
     while(MySerial.available())
         MySerial.read();
     
     requestTelemetry = true;
     
-    BeginWebUpdate();
+    startDShotTimer();
 
-    startTelemetryTimer(); // Timer used to request tlm continually in case ESC rcv bad packet
-    
-    xTaskCreatePinnedToCore(secondCoreTask, "Task1", 10000, NULL, 1, &Task1, 0); 
-
-    Serial.print("Time (ms)"); 
-    Serial.print(","); 
-    Serial.print("dshot"); 
-    Serial.print(",");  
-    Serial.print("Voltage (V)");
-    Serial.print(",");   
-    Serial.print("Current (A)");
-    Serial.print(",");
-    Serial.print("RPM");
-    Serial.print(",");  
-    Serial.println("Thrust (g)");
-
-#ifdef MINIQUADTESTBENCH   
-    dshotUserInputValue = dshotidle;
-    runMQTBSequence = true;     
-    display.clear();              
-    display.setTextAlignment(TEXT_ALIGN_LEFT);
-    display.drawString(0,  0, "Running MQTB Sequence...");    
-    display.display(); 
-#endif
 
 }
 
+int val=0;
+
+uint32_t now=micros();
+uint32_t ticks=now;
+int last_val=val;
+
+uint32_t last_stat=0;
+uint32_t last_smooth=0;;
+float adc_val =0;
+
 void loop() {
-
-    HandleWebUpdate();
-
-    if(loadcell.is_ready()) {
-        thrust = loadcell.get_units(1);
-    }
+    now=micros();
+    if( now - last_rpm >= 25000 )
+        pid_on=false;
+    else
+        pid_on=true;
     
+
+    if(now-ticks >= 100)
+    {
+        ticks=now;
+
+        adc_val = (adc_val * 0.95) + ((analogRead(POT_PIN)*32.0F)*0.05);
+
+        // Just a quick fixed value table for testing at different reference points.
+        val=map(int(adc_val), 0, 4095*32, 0, 1999);
+        if(val>25 && val<200)
+            val=120;
+        else if(val>=200 && val<600)
+            val=200;
+        else if(val>=600 && val<1000)
+            val=300;
+        else if(val>=1000 && val<1400)
+            val=400;
+        else if(val>=1400 && val<1800)
+            val=500;
+        else if(val>=1800)
+            val=600;
+        else
+            val=0;
+
+        if(last_val != val && (val<=0 || val >= 1999 || abs(last_val-val) >= 5))
+        {
+            last_val=val;
+            
+            if(val<=50)
+                target_value=0;
+            else if(val<60)
+                target_value=60;
+            else
+                target_value=val;
+           
+        }
+
+
+        if(now - last_smooth >= 1000)
+        {
+
+            last_smooth=now;
+
+            if(current_value < target_value)
+            {
+                if(current_value<60)
+                    current_value=60;
+                else
+                    current_value+=1;
+
+            }
+            else if(current_value > target_value)
+            {
+                if(target_value < 60)
+                    current_value=0;
+                else
+                    current_value-=1;
+            }
+            target_rpm = constrain(map(current_value,60,1999,130,8000),0,8000);
+        }
+          
+         if(now - last_stat >= 1000000)
+        {
+            last_stat=now;
+            Serial.printf("ms: %d rpm: %d rpm_age: %d volt: %.2f dshot: %d target_rpm %d target_val: %d cv: %d pid: %d\n",now/1000, rpm, (now-last_rpm)/1000, voltage, dshotUserInputValue, target_rpm, target_value, current_value, pid_val);
+        }
+        
+    }
+   
     if(!requestTelemetry) {
-         receiveTelemtrie();
+       receiveTelemtrie();
     } 
     
-#ifdef MINIQUADTESTBENCH
-    if(runMQTBSequence) {
-        currentTime = millis();
-        if(currentTime >= 4000 && currentTime < 6000) {
-            dshotUserInputValue = dshot50;
-        } else if(currentTime >= 6000 && currentTime < 8000) {
-            dshotUserInputValue = dshotidle;
-        } else if(currentTime >= 8000 && currentTime < 10000) {
-            dshotUserInputValue = dshot75;
-        } else if(currentTime >= 10000 && currentTime < 12000) {
-            dshotUserInputValue = dshotidle;
-        } else if(currentTime >= 12000 && currentTime < 14000) {
-            dshotUserInputValue = dshotmax;
-        } else if(currentTime >= 14000 && currentTime < 16000) {
-            dshotUserInputValue = dshotmin;
-        } else if(currentTime >= 16000 && currentTime < 22000) {      
-            dshotUserInputValue = dshotmin + (currentTime-16000)*(dshotmax-dshotmin)/6000.0;        
-        } else if(currentTime >= 24000 && currentTime < 26000) {
-            dshotUserInputValue = dshotidle;
-        } else if(currentTime >= 26000 && currentTime < 28000) {
-            printTelemetry = false;
-            dshotUserInputValue = 0;
-        } 
-    }
-#endif
-
 }
 
 void receiveTelemtrie(){
     static uint8_t SerialBuf[10];
+    
 
         if(MySerial.available()){
             SerialBuf[receivedBytes] = MySerial.read();
@@ -289,7 +290,11 @@ void receiveTelemtrie(){
             uint8_t crc8 = get_crc8(SerialBuf, 9); // get the 8 bit CRC
           
             if(crc8 != SerialBuf[9]) {
-//                Serial.println("CRC transmission failure");
+                // These errors appear to happen on regular basis, at least on the only ESC I tested with
+                // I couldn't see on the scope if anythign was wrong, or if this is just the ESC not sending all the data properly
+                // regardless, at very fast (around 1 ms) telemetry request speed
+                // the average telemetry successful responses always seems to come at 0-2 ms intervals
+                //Serial.println("CRC transmission failure");
                 
                 // Empty Rx Serial of garbage telemtry
                 while(MySerial.available())
@@ -308,47 +313,7 @@ void receiveTelemtrie(){
             ESC_telemetrie[4] = (SerialBuf[7]<<8)|SerialBuf[8]; // eRpM *100
             
             requestTelemetry = true;
-
-            if(!runMQTBSequence) { // Do not update during MQTB sequence.  Slows serial output.
-                updateDisplay();
-            }
-            
-    //      Serial.println("Requested Telemetrie");
-    //      Serial.print("Temperature (C): ");
-    //      Serial.println(ESC_telemetrie[0]); 
-    //      Serial.print("Voltage (V): ");
-    //      Serial.println(ESC_telemetrie[1] / 100.0);   
-    //      Serial.print("Current (mA): ");
-    //      Serial.println(ESC_telemetrie[2] * 100); 
-    //      Serial.print("mA/h: ");
-    //      Serial.println(ESC_telemetrie[3] * 10);   
-    //      Serial.print("eRPM : ");
-    //      Serial.println(ESC_telemetrie[4] * 100);  
-    //      Serial.print("RPM : ");
-    //      Serial.println(ESC_telemetrie[4] * 100 / 7.0);  // 7 = 14 magnet count / 2
-    //      Serial.print("KV : ");
-    //      Serial.println( (ESC_telemetrie[4] * 100 / 7.0) / (ESC_telemetrie[1] / 100.0) );  // 7 = 14 magnet count / 2
-    //      Serial.println(" ");
-    //      Serial.println(" ");
-            
-            if(printTelemetry) {
-                Serial.print(millis()); 
-                Serial.print(","); 
-                Serial.print(dshotUserInputValue); 
-                Serial.print(",");
-          //      Serial.print("Voltage (V): ");
-                Serial.print(ESC_telemetrie[1] / 100.0); 
-                Serial.print(",");   
-          //      Serial.print("Current (A): ");
-                Serial.print(ESC_telemetrie[2] / 10.0); 
-                Serial.print(","); 
-          //      Serial.print("RPM : ");
-                Serial.print(ESC_telemetrie[4] * 100 / (MOTOR_POLES / 2)); 
-                Serial.print(",");  
-                // Thrust
-                Serial.println(thrust);
-            }
-          
+         
             temperature = 0.9*temperature + 0.1*ESC_telemetrie[0];
             if (temperature > temperatureMax) {
                 temperatureMax = temperature;
@@ -364,7 +329,8 @@ void receiveTelemtrie(){
                 currentMax = current;
             }
             
-            erpm = 0.9*erpm + 0.1*(ESC_telemetrie[4] * 100);
+            // This averaging is also working ok for the current PID loop and settings, but I've lowered the weight of older samples
+            erpm = 0.8*erpm + 0.2*(ESC_telemetrie[4] * 100);
             if (erpm > erpmMax) {
                 erpmMax = erpm;
             }
@@ -373,6 +339,7 @@ void receiveTelemtrie(){
             if (rpm > rpmMAX) {
                 rpmMAX = rpm;
             }
+            last_rpm=micros();
             
             if (rpm) {                  // Stops weird numbers :|
                 kv = rpm / voltage / ( (float(dshotUserInputValue) - dshotmin) / (dshotmax - dshotmin) );
@@ -395,6 +362,7 @@ void dshotOutput(uint16_t value, bool telemetry) {
     
     // telemetry bit    
     if (telemetry) {
+        requestTelemetry=true;
         packet = (value << 1) | 1;
     } else {
         packet = (value << 1) | 0;
@@ -429,8 +397,22 @@ void dshotOutput(uint16_t value, bool telemetry) {
           }
         packet <<= 1;
     }
-    
+
+    // Tried to use rmtLoop from latest ESP32 master branch, but it doesn't seem to allow seemless synchronyzed updates,
+    // but also since we need to turn on and off the telemetry bit it wasn't practical so reverted back to the rmtWrite in
+    // a fast loop. It would be nice to find a way to have this dshot loop perfectly working and synced eventually so that there is no
+    // jitter.
+   /* dshotPacket[0].level0 = 0;
+    dshotPacket[0].duration0 = 586;
+    dshotPacket[0].level1 = 0;
+    dshotPacket[0].duration1 = 586;
+    dshotPacket[17].level0 = 0;
+    dshotPacket[17].duration0 = 586;
+    dshotPacket[17].level1 = 0;
+    dshotPacket[17].duration1 = 586;*/
+ 
     rmtWrite(rmt_send, dshotPacket, 16);
+
     
     return;
 
@@ -448,33 +430,4 @@ uint8_t get_crc8(uint8_t *Buf, uint8_t BufLen){
   uint8_t crc = 0, i;
   for( i=0; i<BufLen; i++) crc = update_crc8(Buf[i], crc);
   return (crc);
-}
-
-void updateDisplay() {    
-    display.clear();
-              
-    display.setTextAlignment(TEXT_ALIGN_LEFT);
-    display.drawString(0,  0, "Dshot Packet");
-    display.drawString(0, 10, "Temp C");
-    display.drawString(0, 20, "Volt");
-    display.drawString(0, 30, "mA");
-    display.drawString(0, 40, "eRPM");
-    display.drawString(0, 50, "KV");
-    
-    display.setTextAlignment(TEXT_ALIGN_RIGHT);
-    display.drawString(80, 10, String(temperature));
-    display.drawString(80, 20, String(voltage));
-    display.drawString(80, 30, String(current));
-    display.drawString(80, 40, String(erpm));
-    display.drawString(80, 50, String(kv));
-    
-    display.setTextAlignment(TEXT_ALIGN_RIGHT);
-    display.drawString(128,  0, String(dshotUserInputValue));
-    display.drawString(128, 10, String(temperatureMax));
-    display.drawString(128, 20, String(voltageMin));
-    display.drawString(128, 30, String(currentMax));
-    display.drawString(128, 40, String(erpmMax));
-    display.drawString(128, 50, String(kvMax));
-    
-    display.display();  
 }
